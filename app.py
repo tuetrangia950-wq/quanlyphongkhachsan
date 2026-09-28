@@ -122,6 +122,7 @@ def initialize():
     with connect() as conn:
         for sql in statements:
             conn.execute(sql)
+        # Chỉ tạo 8 phòng gốc nếu cơ sở dữ liệu hoàn toàn chưa có phòng.
         if conn.execute('SELECT COUNT(*) FROM rooms').fetchone()[0] == 0:
             conn.executemany('INSERT INTO rooms(number,room_type,price,status,note) VALUES(?,?,?,?,?)',
                 [(n, t, p, 'Sạch', '') for n,t,p in [
@@ -129,6 +130,34 @@ def initialize():
                     ('201','Superior',1100000),('202','Superior',1100000),
                     ('301','Deluxe',1500000),('302','Deluxe',1500000),
                     ('401','Suite',2500000),('501','Villa',4500000)]])
+
+        # Đánh dấu lần bổ sung 12 phòng để không tự thêm lại phòng đã xóa.
+        conn.execute("""CREATE TABLE IF NOT EXISTS app_meta (
+            meta_key VARCHAR(100) PRIMARY KEY,
+            meta_value VARCHAR(255) NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
+        migrated = conn.execute(
+            'SELECT meta_value FROM app_meta WHERE meta_key=?', ('seed_12_rooms_v1',)
+        ).fetchone()
+        if not migrated:
+            extra_rooms = [
+                ('103','Standard',800000), ('104','Standard',800000),
+                ('105','Standard',800000), ('106','Standard',800000),
+                ('203','Superior',1100000), ('204','Superior',1100000),
+                ('205','Superior',1100000),
+                ('303','Deluxe',1500000), ('304','Deluxe',1500000),
+                ('402','Suite',2500000), ('403','Suite',2500000),
+                ('502','Villa',4500000),
+            ]
+            conn.executemany(
+                """INSERT IGNORE INTO rooms(number,room_type,price,status,note)
+                VALUES(?,?,?,?,?)""",
+                [(n, t, p, 'Sạch', '') for n,t,p in extra_rooms]
+            )
+            conn.execute(
+                'INSERT INTO app_meta(meta_key,meta_value) VALUES(?,?)',
+                ('seed_12_rooms_v1', 'done')
+            )
 
 def rooms():
     return read('''SELECT r.*, CASE WHEN EXISTS
@@ -163,7 +192,18 @@ def message_and_reload(text):
     st.success(text)
     st.rerun()
 
-initialize()
+# Kiểm tra kết nối thật trước khi hiển thị ứng dụng.
+try:
+    with connect() as _db:
+        _db.execute('SELECT 1').fetchone()
+    initialize()
+    db_connected = True
+except mysql.connector.Error as exc:
+    st.error('🔴 Không thể kết nối MySQL Aiven hoặc khởi tạo database.')
+    st.code(f'Mã lỗi: {exc.errno} | {exc.msg}')
+    st.info('Kiểm tra tên database, tài khoản, cổng 27114 và trạng thái dịch vụ trên Aiven.')
+    st.stop()
+
 st.markdown('''<style>
 .block-container{padding-top:1.3rem}
 h1,h2,h3{color:#16375d}
@@ -175,7 +215,8 @@ with st.sidebar:
     menu = st.radio('Điều hướng', ['📊 Tổng quan', '🛏️ Quản lý phòng',
         '📅 Đặt phòng', '🔑 Nhận / Trả phòng', '🧹 Buồng phòng',
         '👥 Khách hàng', '💰 Doanh thu'])
-    st.caption('Dữ liệu lưu trên MySQL • Aiven')
+    st.success('🟢 Đã kết nối MySQL Aiven')
+    st.caption(f'Database: {DB_NAME} | Cổng: {DB_PORT}')
 
 if menu == '📊 Tổng quan':
     st.title('🏨 HOTEL MANAGEMENT SYSTEM')
