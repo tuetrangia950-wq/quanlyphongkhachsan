@@ -1,5 +1,6 @@
 from contextlib import contextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 import mysql.connector
 import pandas as pd
@@ -11,6 +12,9 @@ IMAGE = BASE / 'khachsan.jpg'
 TYPES = {'Standard': 800_000, 'Superior': 1_100_000, 'Deluxe': 1_500_000,
          'Suite': 2_500_000, 'Villa': 4_500_000}
 HOUSEKEEPING = ['Sạch', 'Bẩn', 'Đang vệ sinh', 'Bảo trì']
+
+def today():
+    return datetime.now(ZoneInfo('Asia/Ho_Chi_Minh')).date()
 st.set_page_config(page_title='Quản lý khách sạn', page_icon='🏨', layout='wide')
 
 # Thông tin kết nối Aiven MySQL
@@ -51,6 +55,9 @@ class Result:
     def __init__(self, cursor):
         self.cursor = cursor
         self.lastrowid = cursor.lastrowid
+        self.rowcount = cursor.rowcount
+        if not cursor.with_rows:
+            cursor.close()
     def fetchone(self):
         row = self.cursor.fetchone()
         self.cursor.close()
@@ -63,6 +70,7 @@ class Result:
 @contextmanager
 def connect():
     conn = mysql.connector.connect(**DB_CONFIG)
+    conn.time_zone = '+07:00'
     try:
         yield DBConnection(conn)
         conn.commit()
@@ -131,6 +139,16 @@ def initialize():
                     ('301','Deluxe',1500000),('302','Deluxe',1500000),
                     ('401','Suite',2500000),('501','Villa',4500000)]])
 
+        # Nâng cấp bảng cũ mà không xóa đơn đặt phòng hiện có.
+        for field in ('adults', 'children'):
+            found = conn.execute(
+                'SELECT COUNT(*) FROM information_schema.COLUMNS '
+                'WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?',
+                ('bookings', field)
+            ).fetchone()[0]
+            if not found:
+                conn.execute(f'ALTER TABLE bookings ADD COLUMN {field} INT NOT NULL DEFAULT 0')
+
         # Đánh dấu lần bổ sung 12 phòng để không tự thêm lại phòng đã xóa.
         conn.execute("""CREATE TABLE IF NOT EXISTS app_meta (
             meta_key VARCHAR(100) PRIMARY KEY,
@@ -162,7 +180,10 @@ def initialize():
 def rooms():
     return read('''SELECT r.*, CASE WHEN EXISTS
         (SELECT 1 FROM bookings b WHERE b.room_id=r.id AND b.status='Đang ở')
-        THEN 'Có khách' ELSE r.status END AS display_status
+        THEN 'Có khách' WHEN EXISTS
+        (SELECT 1 FROM bookings b WHERE b.room_id=r.id AND b.status='Đã đặt'
+         AND b.checkin <= CURRENT_DATE() AND b.checkout > CURRENT_DATE())
+        THEN 'Đã đặt hôm nay' ELSE r.status END AS display_status
         FROM rooms r ORDER BY r.number''')
 
 def customers():
@@ -189,7 +210,7 @@ def booking_conflict(conn, room_id, start, end, exclude=None):
     return conn.execute(sql, params).fetchone()[0] > 0
 
 def message_and_reload(text):
-    st.success(text)
+    st.session_state['flash_message'] = text
     st.rerun()
 
 # Kiểm tra kết nối thật trước khi hiển thị ứng dụng.
@@ -218,6 +239,10 @@ with st.sidebar:
     st.success('🟢 Đã kết nối MySQL Aiven')
     st.caption(f'Database: {DB_NAME} | Cổng: {DB_PORT}')
 
+_flash = st.session_state.pop('flash_message', None)
+if _flash:
+    st.success(_flash)
+
 if menu == '📊 Tổng quan':
     st.title('🏨 HOTEL MANAGEMENT SYSTEM')
     if IMAGE.exists():
@@ -228,13 +253,22 @@ if menu == '📊 Tổng quan':
     r, b = rooms(), bookings()
     occupied = int((r.display_status == 'Có khách').sum())
     clean = int((r.display_status == 'Sạch').sum())
-    revenue = int(b.loc[b.status == 'Đã trả', 'total'].sum()) if not b.empty else 0
+    pending = b[b.status == 'Đã đặt']
+    active = b[b.status == 'Đang ở']
+    completed = b[b.status == 'Đã trả']
+    revenue = int(completed.total.sum())
+    expected = int(pending.total.sum() + active.total.sum())
     a, c, d, e = st.columns(4)
     a.metric('Tổng số phòng', len(r))
-    c.metric('Đang có khách', occupied)
-    d.metric('Phòng sạch chưa có khách', clean)
-    e.metric('Doanh thu ghi nhận', vnd(revenue))
+    c.metric('Đơn đặt chờ nhận', len(pending))
+    d.metric('Đang có khách (phòng)', occupied)
+    e.metric('Phòng sạch chưa có khách', clean)
+    f, g, h = st.columns(3)
+    f.metric('Khách đang lưu trú (người)', int((active.adults + active.children).sum()))
+    g.metric('Doanh thu dự kiến (chưa trả)', vnd(expected))
+    h.metric('Doanh thu đã ghi nhận', vnd(revenue))
     st.metric('Công suất phòng hiện tại', f'{occupied / len(r) * 100:.1f}%' if len(r) else '0%')
+    st.caption('Đơn đặt trong tương lai không tính là phòng đang có khách. Doanh thu chỉ ghi nhận sau Check-out.')
     if not r.empty:
         counts = r.display_status.value_counts().rename_axis('Trạng thái').reset_index(name='Số phòng')
         st.plotly_chart(px.pie(counts, names='Trạng thái', values='Số phòng', hole=.4),
@@ -301,8 +335,8 @@ elif menu == '🛏️ Quản lý phòng':
                         st.error('Không thể xóa phòng đã có lịch sử đặt phòng.')
                     else:
                         conn.execute('DELETE FROM rooms WHERE id=?',(room_id,))
-                        st.success('Đã xóa phòng.')
-                        st.rerun()
+                if not used:
+                    message_and_reload('Đã xóa phòng.')
 
 elif menu == '📅 Đặt phòng':
     st.title('📅 Đặt phòng')
@@ -319,13 +353,15 @@ elif menu == '📅 Đặt phòng':
                             for x in r.itertuples() if x.status != 'Bảo trì'}
             with st.form('create_booking'):
                 customer_label = st.selectbox('Khách hàng', list(customer_options))
-                start = st.date_input('Ngày nhận', date.today())
-                end = st.date_input('Ngày trả', date.today()+timedelta(days=1))
+                start = st.date_input('Ngày nhận', today())
+                end = st.date_input('Ngày trả', today()+timedelta(days=1))
                 room_label = st.selectbox('Phòng', list(room_options)) if room_options else None
+                adults = st.number_input('Số người lớn', min_value=1, max_value=20, value=2)
+                children = st.number_input('Số trẻ em', min_value=0, max_value=20, value=0)
                 note = st.text_area('Yêu cầu đặc biệt')
                 if st.form_submit_button('Xác nhận đặt', type='primary', disabled=not room_options):
                     room_id = room_options[room_label]
-                    if start < date.today() or end <= start:
+                    if start < today() or end <= start:
                         st.error('Ngày nhận không được trong quá khứ và ngày trả phải sau ngày nhận.')
                     else:
                         with connect() as conn:
@@ -335,10 +371,10 @@ elif menu == '📅 Đặt phòng':
                             else:
                                 total = (end-start).days * current['price']
                                 conn.execute('''INSERT INTO bookings
-                                    (customer_id,room_id,checkin,checkout,total,note)
-                                    VALUES(?,?,?,?,?,?)''',
-                                    (customer_options[customer_label],room_id,str(start),str(end),total,note))
-                                st.success(f'Đặt phòng thành công. Dự kiến: {vnd(total)}')
+                                    (customer_id,room_id,checkin,checkout,total,note,adults,children)
+                                    VALUES(?,?,?,?,?,?,?,?)''',
+                                    (customer_options[customer_label],room_id,str(start),str(end),total,note,int(adults),int(children)))
+                        message_and_reload(f'Đặt phòng thành công. Dự kiến: {vnd(total)}')
     with tab2:
         b = bookings()
         if not b.empty:
@@ -377,11 +413,14 @@ elif menu == '🔑 Nhận / Trả phòng':
                                             (int(item.room_id),)).fetchone()[0]
                     if room['status'] != 'Sạch' or occupied:
                         st.error('Phòng chưa sạch hoặc đang có khách.')
-                    elif not (date.fromisoformat(item.checkin) <= date.today() < date.fromisoformat(item.checkout)):
+                    elif not (date.fromisoformat(item.checkin) <= today() < date.fromisoformat(item.checkout)):
                         st.error('Chỉ nhận phòng trong khoảng ngày đặt. Hãy điều chỉnh đặt phòng nếu cần.')
                     else:
-                        conn.execute("UPDATE bookings SET status='Đang ở' WHERE id=? AND status='Đã đặt'",(bid,))
-                        message_and_reload('Check-in thành công.')
+                        result = conn.execute("UPDATE bookings SET status='Đang ở' WHERE id=? AND status='Đã đặt'",(bid,))
+                        if result.rowcount != 1:
+                            raise ValueError('Đơn đặt phòng đã thay đổi, vui lòng tải lại.')
+                if room['status'] == 'Sạch' and not occupied and (date.fromisoformat(item.checkin) <= today() < date.fromisoformat(item.checkout)):
+                    message_and_reload('Check-in thành công.')
     with tab2:
         active = b[b.status == 'Đang ở']
         if active.empty:
@@ -398,7 +437,7 @@ elif menu == '🔑 Nhận / Trả phòng':
             if st.button('Xác nhận Check-out', type='primary'):
                 with connect() as conn:
                     conn.execute("UPDATE bookings SET status='Đã trả',actual_checkout=?,total=? WHERE id=? AND status='Đang ở'",
-                                 (str(date.today()),total,bid))
+                                 (str(today()),total,bid))
                     conn.execute("UPDATE rooms SET status='Bẩn' WHERE id=?",(int(item.room_id),))
                 message_and_reload('Check-out thành công. Phòng đã chuyển sang trạng thái Bẩn.')
 
@@ -421,7 +460,8 @@ elif menu == '🧹 Buồng phòng':
                     st.error('Phòng đang có khách. Không thay đổi trạng thái bằng màn hình này.')
                 else:
                     conn.execute('UPDATE rooms SET status=? WHERE id=?',(new_status,room_id))
-                    message_and_reload('Đã cập nhật tình trạng phòng.')
+            if not occupied:
+                message_and_reload('Đã cập nhật tình trạng phòng.')
 
 elif menu == '👥 Khách hàng':
     st.title('👥 Khách hàng')
