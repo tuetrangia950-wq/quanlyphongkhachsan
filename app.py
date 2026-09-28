@@ -2,6 +2,10 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
+import os
+import hmac
+import hashlib
+import secrets
 import mysql.connector
 import pandas as pd
 import plotly.express as px
@@ -19,7 +23,7 @@ st.set_page_config(page_title='Khách sạn Hi Vọng', page_icon='🏨', layout
 
 # Thông tin kết nối Aiven MySQL
 DB_USER = "avnadmin"
-DB_PASSWORD = "AVNS_sQe0LzJogTMG4gdz-By"
+DB_PASSWORD = st.secrets.get('DB_PASSWORD', os.environ.get('DB_PASSWORD', ''))
 DB_HOST = "mysql-39428747-tuetrangia950-3ce0.j.aivencloud.com"
 DB_PORT = 27114
 DB_NAME = "defaultdb"  # Đổi nếu database của bạn có tên khác
@@ -127,6 +131,14 @@ def initialize():
             CONSTRAINT chk_dates CHECK (checkout > checkin)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
     ]
+    statements.append("""CREATE TABLE IF NOT EXISTS employees (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(80) NOT NULL UNIQUE,
+        full_name VARCHAR(255) NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        role VARCHAR(20) NOT NULL DEFAULT 'staff',
+        active TINYINT(1) NOT NULL DEFAULT 1
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
     with connect() as conn:
         for sql in statements:
             conn.execute(sql)
@@ -242,7 +254,77 @@ def message_and_reload(text):
     st.session_state['flash_message'] = text
     st.rerun()
 
+# Mật khẩu nhân viên được băm có salt, không lưu mật khẩu dạng văn bản.
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 310000)
+    return 'pbkdf2_sha256$310000$' + salt.hex() + '$' + digest.hex()
+
+def verify_password(password, encoded):
+    try:
+        algorithm, rounds, salt_hex, digest_hex = encoded.split('$')
+        if algorithm != 'pbkdf2_sha256':
+            return False
+        actual = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'),
+                                    bytes.fromhex(salt_hex), int(rounds))
+        return hmac.compare_digest(actual, bytes.fromhex(digest_hex))
+    except (ValueError, TypeError):
+        return False
+
+def login_screen():
+    st.title('🏨 KHÁCH SẠN HI VỌNG')
+    st.subheader('Đăng nhập nhân viên')
+    with connect() as conn:
+        count = conn.execute('SELECT COUNT(*) FROM employees').fetchone()[0]
+    if count == 0:
+        # Khóa khởi tạo phải do chủ ứng dụng đặt trong Streamlit Cloud Secrets.
+        setup_token = st.secrets.get('ADMIN_SETUP_TOKEN', os.environ.get('ADMIN_SETUP_TOKEN', ''))
+        if not setup_token:
+            st.warning('Chưa có tài khoản quản trị. Chủ ứng dụng cần thêm ADMIN_SETUP_TOKEN vào Streamlit Cloud → App settings → Secrets trước khi tạo tài khoản đầu tiên.')
+            st.stop()
+        st.info('Thiết lập tài khoản quản trị lần đầu.')
+        with st.form('first_admin'):
+            token = st.text_input('Mã thiết lập quản trị', type='password')
+            username = st.text_input('Tên đăng nhập quản trị').strip().lower()
+            full_name = st.text_input('Họ và tên')
+            password = st.text_input('Mật khẩu mới (ít nhất 12 ký tự)', type='password')
+            confirm = st.text_input('Nhập lại mật khẩu', type='password')
+            submit = st.form_submit_button('Tạo tài khoản quản trị', type='primary')
+        if submit:
+            if not hmac.compare_digest(token, setup_token):
+                st.error('Mã thiết lập không đúng.')
+            elif not username or not full_name.strip() or len(password) < 12 or password != confirm:
+                st.error('Nhập đủ thông tin; mật khẩu tối thiểu 12 ký tự và phải khớp.')
+            else:
+                try:
+                    with connect() as conn:
+                        conn.execute('INSERT INTO employees(username,full_name,password_hash,role) VALUES(?,?,?,?)',
+                                     (username, full_name.strip(), hash_password(password), 'admin'))
+                    st.success('Đã tạo tài khoản. Vui lòng đăng nhập.')
+                    st.rerun()
+                except mysql.connector.IntegrityError:
+                    st.error('Tên đăng nhập đã tồn tại.')
+        st.stop()
+    with st.form('employee_login'):
+        username = st.text_input('Tên đăng nhập').strip().lower()
+        password = st.text_input('Mật khẩu', type='password')
+        submit = st.form_submit_button('Đăng nhập', type='primary')
+    if submit:
+        with connect() as conn:
+            employee = conn.execute('SELECT * FROM employees WHERE username=? AND active=1',
+                                    (username,)).fetchone()
+        if employee and verify_password(password, employee['password_hash']):
+            st.session_state['employee'] = {'id': employee['id'], 'name': employee['full_name'],
+                                            'role': employee['role']}
+            st.rerun()
+        else:
+            st.error('Sai tên đăng nhập, mật khẩu hoặc tài khoản đã bị khóa.')
+    st.stop()
+
 # Kiểm tra kết nối thật trước khi hiển thị ứng dụng.
+if not DB_PASSWORD:
+    st.error('Thiếu DB_PASSWORD trong Streamlit Secrets.')
+    st.stop()
 try:
     with connect() as _db:
         _db.execute('SELECT 1').fetchone()
@@ -254,6 +336,9 @@ except mysql.connector.Error as exc:
     st.info('Kiểm tra tên database, tài khoản, cổng 27114 và trạng thái dịch vụ trên Aiven.')
     st.stop()
 
+if 'employee' not in st.session_state:
+    login_screen()
+
 st.markdown('''<style>
 .block-container{padding-top:1.3rem}
 h1,h2,h3{color:#16375d}
@@ -262,9 +347,16 @@ h1,h2,h3{color:#16375d}
 
 with st.sidebar:
     st.title('🏨 HI VỌNG HOTEL')
-    menu = st.radio('Điều hướng', ['📊 Tổng quan', '🛏️ Quản lý phòng',
+    st.caption('Nhân viên: ' + st.session_state['employee']['name'])
+    if st.button('🚪 Đăng xuất'):
+        st.session_state.clear()
+        st.rerun()
+    menu_items = ['📊 Tổng quan', '🛏️ Quản lý phòng',
         '📅 Đặt phòng', '🔑 Nhận / Trả phòng', '🧹 Buồng phòng',
-        '👥 Khách hàng', '💰 Doanh thu'], key='main_menu')
+        '👥 Khách hàng', '💰 Doanh thu']
+    if st.session_state['employee']['role'] == 'admin':
+        menu_items.append('🔐 Nhân viên')
+    menu = st.radio('Điều hướng', menu_items, key='main_menu')
     st.success('🟢 Đã kết nối MySQL Aiven')
     st.caption(f'Database: {DB_NAME} | Cổng: {DB_PORT}')
 
@@ -595,4 +687,48 @@ elif menu == '💰 Doanh thu':
                            file_name='bao_cao_doanh_thu.csv',mime='text/csv')
 
 
+
+
+elif menu == '🔐 Nhân viên' and st.session_state['employee']['role'] == 'admin':
+    st.title('🔐 Quản lý tài khoản nhân viên')
+    with st.form('create_employee'):
+        username = st.text_input('Tên đăng nhập mới').strip().lower()
+        full_name = st.text_input('Họ tên nhân viên')
+        password = st.text_input('Mật khẩu tạm (tối thiểu 12 ký tự)', type='password')
+        role = st.selectbox('Vai trò', ['staff', 'admin'], format_func=lambda x: 'Nhân viên' if x == 'staff' else 'Quản trị')
+        if st.form_submit_button('Tạo nhân viên'):
+            if not username or not full_name.strip() or len(password) < 12:
+                st.error('Nhập đầy đủ thông tin và mật khẩu tối thiểu 12 ký tự.')
+            else:
+                try:
+                    write('INSERT INTO employees(username,full_name,password_hash,role) VALUES(?,?,?,?)',
+                          (username, full_name.strip(), hash_password(password), role))
+                    st.success('Đã tạo tài khoản nhân viên.')
+                except mysql.connector.IntegrityError:
+                    st.error('Tên đăng nhập đã tồn tại.')
+    employee_df = read('SELECT id, username, full_name, role, active FROM employees ORDER BY id')
+    st.dataframe(employee_df, use_container_width=True, hide_index=True)
+    other = employee_df[employee_df['id'] != st.session_state['employee']['id']]
+    if not other.empty:
+        options = {f"{row.username} – {row.full_name}": int(row.id) for row in other.itertuples()}
+        chosen = options[st.selectbox('Chọn tài khoản để khóa / mở khóa', list(options))]
+        if st.button('Đổi trạng thái tài khoản'):
+            write('UPDATE employees SET active=1-active WHERE id=?', (chosen,))
+            st.rerun()
+    st.subheader('Đổi mật khẩu của tôi')
+    with st.form('change_password'):
+        old_password = st.text_input('Mật khẩu hiện tại', type='password')
+        new_password = st.text_input('Mật khẩu mới', type='password')
+        if st.form_submit_button('Đổi mật khẩu'):
+            with connect() as conn:
+                me = conn.execute('SELECT password_hash FROM employees WHERE id=?',
+                                  (st.session_state['employee']['id'],)).fetchone()
+            if not verify_password(old_password, me['password_hash']):
+                st.error('Mật khẩu hiện tại không đúng.')
+            elif len(new_password) < 12:
+                st.error('Mật khẩu mới phải có ít nhất 12 ký tự.')
+            else:
+                write('UPDATE employees SET password_hash=? WHERE id=?',
+                      (hash_password(new_password), st.session_state['employee']['id']))
+                st.success('Đã đổi mật khẩu.')
 
