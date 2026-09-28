@@ -15,7 +15,7 @@ HOUSEKEEPING = ['Sạch', 'Bẩn', 'Đang vệ sinh', 'Bảo trì']
 
 def today():
     return datetime.now(ZoneInfo('Asia/Ho_Chi_Minh')).date()
-st.set_page_config(page_title='Quản lý khách sạn', page_icon='🏨', layout='wide')
+st.set_page_config(page_title='KHÁCH SẠN HI VỌNG', page_icon='🏨', layout='wide')
 
 # Thông tin kết nối Aiven MySQL
 DB_USER = "avnadmin"
