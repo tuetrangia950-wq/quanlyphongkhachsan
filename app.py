@@ -149,6 +149,21 @@ def initialize():
             if not found:
                 conn.execute(f'ALTER TABLE bookings ADD COLUMN {field} INT NOT NULL DEFAULT 0')
 
+        # Bổ sung thông tin khách hàng vào bảng hiện có, không xóa dữ liệu cũ.
+        customer_columns = {
+            'citizen_id': "VARCHAR(20) NULL",
+            'birth_date': "DATE NULL",
+            'address': "TEXT NULL",
+        }
+        for field, sql_type in customer_columns.items():
+            found = conn.execute(
+                'SELECT COUNT(*) FROM information_schema.COLUMNS '
+                'WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?',
+                ('customers', field)
+            ).fetchone()[0]
+            if not found:
+                conn.execute(f'ALTER TABLE customers ADD COLUMN {field} {sql_type}')
+
         # Đánh dấu lần bổ sung 12 phòng để không tự thêm lại phòng đã xóa.
         conn.execute("""CREATE TABLE IF NOT EXISTS app_meta (
             meta_key VARCHAR(100) PRIMARY KEY,
@@ -188,6 +203,20 @@ def rooms():
 
 def customers():
     return read('SELECT * FROM customers ORDER BY id DESC')
+
+def customers_with_rooms():
+    # Mỗi khách một dòng; chỉ hiện phòng có đơn chưa hủy và chưa trả.
+    return read('''SELECT c.id, c.name, c.phone, c.email,
+        c.citizen_id, c.birth_date, c.address,
+        COALESCE(GROUP_CONCAT(DISTINCT CASE
+            WHEN b.status IN ('Đã đặt', 'Đang ở') THEN r.number
+            ELSE NULL END ORDER BY r.number SEPARATOR ', '), 'Chưa đặt') AS room_numbers
+        FROM customers c
+        LEFT JOIN bookings b ON b.customer_id=c.id
+        LEFT JOIN rooms r ON r.id=b.room_id
+        GROUP BY c.id, c.name, c.phone, c.email,
+                 c.citizen_id, c.birth_date, c.address
+        ORDER BY c.id DESC''')
 
 def bookings():
     return read('''SELECT b.*, c.name AS customer, c.phone, r.number AS room,
@@ -235,7 +264,7 @@ with st.sidebar:
     st.title('🏨 HOTEL MANAGER')
     menu = st.radio('Điều hướng', ['📊 Tổng quan', '🛏️ Quản lý phòng',
         '📅 Đặt phòng', '🔑 Nhận / Trả phòng', '🧹 Buồng phòng',
-        '👥 Khách hàng', '💰 Doanh thu'])
+        '👥 Khách hàng', '💰 Doanh thu'], key='main_menu')
     st.success('🟢 Đã kết nối MySQL Aiven')
     st.caption(f'Database: {DB_NAME} | Cổng: {DB_PORT}')
 
@@ -351,8 +380,16 @@ elif menu == '📅 Đặt phòng':
             customer_options = {f'{x.id} – {x.name}':int(x.id) for x in c.itertuples()}
             room_options = {f'{x.number} – {x.room_type} – {vnd(x.price)}/đêm':int(x.id)
                             for x in r.itertuples() if x.status != 'Bảo trì'}
+            # Tự chọn khách vừa được tạo sau khi chuyển trang.
+            new_customer_id = st.session_state.get('booking_customer_id')
+            customer_labels = list(customer_options)
+            default_index = next((i for i, label in enumerate(customer_labels)
+                                  if customer_options[label] == new_customer_id), 0)
+            if new_customer_id is not None:
+                st.info('Đã lưu khách hàng. Vui lòng chọn phòng và ngày lưu trú để hoàn tất đặt phòng.')
             with st.form('create_booking'):
-                customer_label = st.selectbox('Khách hàng', list(customer_options))
+                customer_label = st.selectbox('Khách hàng', customer_labels,
+                                              index=default_index)
                 start = st.date_input('Ngày nhận', today())
                 end = st.date_input('Ngày trả', today()+timedelta(days=1))
                 room_label = st.selectbox('Phòng', list(room_options)) if room_options else None
@@ -374,6 +411,7 @@ elif menu == '📅 Đặt phòng':
                                     (customer_id,room_id,checkin,checkout,total,note,adults,children)
                                     VALUES(?,?,?,?,?,?,?,?)''',
                                     (customer_options[customer_label],room_id,str(start),str(end),total,note,int(adults),int(children)))
+                        st.session_state.pop('booking_customer_id', None)
                         message_and_reload(f'Đặt phòng thành công. Dự kiến: {vnd(total)}')
     with tab2:
         b = bookings()
@@ -467,24 +505,71 @@ elif menu == '👥 Khách hàng':
     st.title('👥 Khách hàng')
     tab1, tab2 = st.tabs(['Danh sách', 'Thêm khách hàng'])
     with tab1:
-        c = customers()
-        keyword = st.text_input('Tìm tên hoặc số điện thoại').strip()
-        if keyword:
-            c = c[c.name.str.contains(keyword,case=False,regex=False,na=False) |
-                  c.phone.str.contains(keyword,case=False,regex=False,na=False)]
-        table(c)
+        c = customers_with_rooms()
+        keyword = st.text_input('Tìm tên, số điện thoại hoặc số phòng').strip()
+        if keyword and not c.empty:
+            c = c[c.name.str.contains(keyword, case=False, regex=False, na=False) |
+                  c.phone.str.contains(keyword, case=False, regex=False, na=False) |
+                  c.room_numbers.str.contains(keyword, case=False, regex=False, na=False)]
+        if not c.empty:
+            # Không hiển thị toàn bộ số CCCD trên bảng tổng hợp.
+            c = c.copy()
+            c['citizen_id'] = c.citizen_id.fillna('').apply(
+                lambda x: ('*' * max(0, len(str(x)) - 4) + str(x)[-4:]) if x else '')
+            c['birth_date'] = c.birth_date.fillna('').astype(str)
+            table(c.rename(columns={
+                'id': 'Mã KH', 'name': 'Họ tên', 'phone': 'Số điện thoại',
+                'email': 'Email', 'citizen_id': 'CCCD (ẩn bớt)',
+                'birth_date': 'Ngày sinh', 'address': 'Địa chỉ',
+                'room_numbers': 'Số phòng'
+            }))
+        else:
+            st.info('Chưa có khách hàng phù hợp.')
     with tab2:
+        st.caption('Sau khi lưu thành công, ứng dụng tự chuyển sang Đặt phòng và chọn sẵn khách vừa tạo.')
         with st.form('new_customer'):
             name = st.text_input('Họ tên *')
+            citizen_id = st.text_input('Số căn cước công dân', max_chars=12,
+                                       help='Nhập 12 chữ số; có thể để trống nếu chưa cung cấp.')
+            birth_date = st.date_input('Ngày tháng năm sinh', value=None,
+                                       min_value=date(1900, 1, 1), max_value=today(),
+                                       format='DD/MM/YYYY')
+            address = st.text_area('Địa chỉ')
             phone = st.text_input('Số điện thoại')
             email = st.text_input('Email')
-            if st.form_submit_button('Thêm khách hàng',type='primary'):
-                if not name.strip():
+            if st.form_submit_button('Lưu khách hàng và chuyển sang đặt phòng', type='primary'):
+                name = name.strip()
+                citizen_id = citizen_id.strip()
+                if not name:
                     st.error('Vui lòng nhập họ tên.')
+                elif citizen_id and (len(citizen_id) != 12 or not citizen_id.isdigit()):
+                    st.error('Số CCCD phải gồm đúng 12 chữ số.')
+                elif birth_date and birth_date > today():
+                    st.error('Ngày sinh không được ở tương lai.')
                 else:
-                    write('INSERT INTO customers(name,phone,email) VALUES(?,?,?)',
-                          (name.strip(),phone.strip(),email.strip()))
-                    message_and_reload('Đã thêm khách hàng.')
+                    try:
+                        with connect() as conn:
+                            if citizen_id:
+                                duplicate = conn.execute(
+                                    'SELECT id FROM customers WHERE citizen_id=? LIMIT 1',
+                                    (citizen_id,)
+                                ).fetchone()
+                                if duplicate:
+                                    st.error('CCCD đã tồn tại. Vui lòng kiểm tra khách hàng trong danh sách.')
+                                    st.stop()
+                            new_id = conn.execute(
+                                'INSERT INTO customers(name,phone,email,citizen_id,birth_date,address) '
+                                'VALUES(?,?,?,?,?,?)',
+                                (name, phone.strip(), email.strip(), citizen_id or None,
+                                 birth_date, address.strip())
+                            ).lastrowid
+                        # Chỉ chuyển trang SAU KHI transaction đã commit thành công.
+                        st.session_state['booking_customer_id'] = int(new_id)
+                        st.session_state['main_menu'] = '📅 Đặt phòng'
+                        st.session_state['flash_message'] = 'Đã lưu khách hàng thành công.'
+                        st.rerun()
+                    except mysql.connector.Error as exc:
+                        st.error(f'Không thể lưu khách hàng: {exc.msg}')
 
 elif menu == '💰 Doanh thu':
     st.title('💰 Báo cáo doanh thu')
