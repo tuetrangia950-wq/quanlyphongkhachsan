@@ -1,28 +1,70 @@
-import sqlite3
 from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
-
+import mysql.connector
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 BASE = Path(__file__).resolve().parent
-DB = BASE / 'hotel.db'
 IMAGE = BASE / 'khachsan.jpg'
 TYPES = {'Standard': 800_000, 'Superior': 1_100_000, 'Deluxe': 1_500_000,
          'Suite': 2_500_000, 'Villa': 4_500_000}
 HOUSEKEEPING = ['Sạch', 'Bẩn', 'Đang vệ sinh', 'Bảo trì']
-
 st.set_page_config(page_title='Quản lý khách sạn', page_icon='🏨', layout='wide')
+
+# Thông tin kết nối Aiven MySQL
+DB_USER = "avnadmin"
+DB_PASSWORD = "AVNS_sQe0LzJogTMG4gdz-By"
+DB_HOST = "mysql-39428747-tuetrangia950-3ce0.j.aivencloud.com"
+DB_PORT = 27114
+DB_NAME = "defaultdb"  # Đổi nếu database của bạn có tên khác
+
+DB_CONFIG = dict(
+    host=DB_HOST, port=DB_PORT, user=DB_USER,
+    password=DB_PASSWORD, database=DB_NAME,
+    connection_timeout=15, ssl_disabled=False,
+    charset="utf8mb4", use_unicode=True,
+)
+
+class Row(dict):
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return super().__getitem__(key)
+
+class DBConnection:
+    def __init__(self, connection):
+        self.connection = connection
+    def execute(self, sql, params=()):
+        cur = self.connection.cursor(dictionary=True)
+        cur.execute(sql.replace('?', '%s'), tuple(params))
+        return Result(cur)
+    def executemany(self, sql, params):
+        cur = self.connection.cursor()
+        try:
+            cur.executemany(sql.replace('?', '%s'), params)
+        finally:
+            cur.close()
+
+class Result:
+    def __init__(self, cursor):
+        self.cursor = cursor
+        self.lastrowid = cursor.lastrowid
+    def fetchone(self):
+        row = self.cursor.fetchone()
+        self.cursor.close()
+        return Row(row) if row is not None else None
+    def fetchall(self):
+        rows = self.cursor.fetchall()
+        self.cursor.close()
+        return [Row(row) for row in rows]
 
 @contextmanager
 def connect():
-    conn = sqlite3.connect(DB, timeout=15)
-    conn.row_factory = sqlite3.Row
-    conn.execute('PRAGMA foreign_keys=ON')
+    conn = mysql.connector.connect(**DB_CONFIG)
     try:
-        yield conn
+        yield DBConnection(conn)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -32,36 +74,61 @@ def connect():
 
 def read(sql, params=()):
     with connect() as conn:
-        return pd.read_sql_query(sql, conn, params=params)
+        cur = conn.connection.cursor(dictionary=True)
+        try:
+            cur.execute(sql.replace('?', '%s'), tuple(params))
+            cols = cur.column_names
+            rows = cur.fetchall()
+            return pd.DataFrame(rows, columns=cols)
+        finally:
+            cur.close()
 
 def write(sql, params=()):
     with connect() as conn:
         return conn.execute(sql, params).lastrowid
 
 def initialize():
+    statements = [
+        """CREATE TABLE IF NOT EXISTS rooms (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            number VARCHAR(30) NOT NULL UNIQUE,
+            room_type VARCHAR(50) NOT NULL,
+            price BIGINT NOT NULL,
+            status VARCHAR(40) NOT NULL DEFAULT 'Sạch',
+            note TEXT NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+        """CREATE TABLE IF NOT EXISTS customers (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            phone VARCHAR(50) NOT NULL DEFAULT '',
+            email VARCHAR(255) NOT NULL DEFAULT ''
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+        """CREATE TABLE IF NOT EXISTS bookings (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            customer_id INT NOT NULL,
+            room_id INT NOT NULL,
+            checkin VARCHAR(10) NOT NULL,
+            checkout VARCHAR(10) NOT NULL,
+            actual_checkout VARCHAR(10) NULL,
+            status VARCHAR(40) NOT NULL DEFAULT 'Đã đặt',
+            total BIGINT NOT NULL DEFAULT 0,
+            note TEXT NOT NULL,
+            INDEX idx_room_dates (room_id, checkin, checkout),
+            CONSTRAINT fk_customer FOREIGN KEY (customer_id) REFERENCES customers(id),
+            CONSTRAINT fk_room FOREIGN KEY (room_id) REFERENCES rooms(id),
+            CONSTRAINT chk_dates CHECK (checkout > checkin)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
+    ]
     with connect() as conn:
-        conn.executescript('''
-        CREATE TABLE IF NOT EXISTS rooms (
-            id INTEGER PRIMARY KEY, number TEXT UNIQUE NOT NULL,
-            room_type TEXT NOT NULL, price INTEGER NOT NULL CHECK(price>=0),
-            status TEXT NOT NULL DEFAULT 'Sạch', note TEXT NOT NULL DEFAULT '');
-        CREATE TABLE IF NOT EXISTS customers (
-            id INTEGER PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL DEFAULT '',
-            email TEXT NOT NULL DEFAULT '');
-        CREATE TABLE IF NOT EXISTS bookings (
-            id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
-            room_id INTEGER NOT NULL REFERENCES rooms(id),
-            checkin TEXT NOT NULL, checkout TEXT NOT NULL,
-            actual_checkout TEXT, status TEXT NOT NULL DEFAULT 'Đã đặt',
-            total INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '',
-            CHECK(checkout > checkin));
-        ''')
+        for sql in statements:
+            conn.execute(sql)
         if conn.execute('SELECT COUNT(*) FROM rooms').fetchone()[0] == 0:
-            conn.executemany('INSERT INTO rooms(number,room_type,price) VALUES(?,?,?)',
-                [('101','Standard',800000), ('102','Standard',800000),
-                 ('201','Superior',1100000), ('202','Superior',1100000),
-                 ('301','Deluxe',1500000), ('302','Deluxe',1500000),
-                 ('401','Suite',2500000), ('501','Villa',4500000)])
+            conn.executemany('INSERT INTO rooms(number,room_type,price,status,note) VALUES(?,?,?,?,?)',
+                [(n, t, p, 'Sạch', '') for n,t,p in [
+                    ('101','Standard',800000),('102','Standard',800000),
+                    ('201','Superior',1100000),('202','Superior',1100000),
+                    ('301','Deluxe',1500000),('302','Deluxe',1500000),
+                    ('401','Suite',2500000),('501','Villa',4500000)]])
 
 def rooms():
     return read('''SELECT r.*, CASE WHEN EXISTS
@@ -108,7 +175,7 @@ with st.sidebar:
     menu = st.radio('Điều hướng', ['📊 Tổng quan', '🛏️ Quản lý phòng',
         '📅 Đặt phòng', '🔑 Nhận / Trả phòng', '🧹 Buồng phòng',
         '👥 Khách hàng', '💰 Doanh thu'])
-    st.caption('Phiên bản thực hành • Dữ liệu lưu trên máy')
+    st.caption('Dữ liệu lưu trên MySQL • Aiven')
 
 if menu == '📊 Tổng quan':
     st.title('🏨 HOTEL MANAGEMENT SYSTEM')
@@ -159,7 +226,7 @@ elif menu == '🛏️ Quản lý phòng':
                         write('INSERT INTO rooms(number,room_type,price,status,note) VALUES(?,?,?,?,?)',
                               (number.strip(),kind,price,status,note))
                         message_and_reload('Đã thêm phòng.')
-                    except sqlite3.IntegrityError:
+                    except mysql.connector.IntegrityError:
                         st.error('Số phòng đã tồn tại.')
     with tab3:
         r = rooms()
@@ -183,7 +250,7 @@ elif menu == '🛏️ Quản lý phòng':
                             write('UPDATE rooms SET number=?,room_type=?,price=?,status=?,note=? WHERE id=?',
                                   (number.strip(),kind,price,status,note,room_id))
                             message_and_reload('Đã cập nhật phòng.')
-                        except sqlite3.IntegrityError:
+                        except mysql.connector.IntegrityError:
                             st.error('Số phòng đã tồn tại.')
             confirm = st.checkbox('Xác nhận xóa phòng này')
             if st.button('Xóa phòng', disabled=not confirm):
@@ -193,7 +260,8 @@ elif menu == '🛏️ Quản lý phòng':
                         st.error('Không thể xóa phòng đã có lịch sử đặt phòng.')
                     else:
                         conn.execute('DELETE FROM rooms WHERE id=?',(room_id,))
-                        message_and_reload('Đã xóa phòng.')
+                        st.success('Đã xóa phòng.')
+                        st.rerun()
 
 elif menu == '📅 Đặt phòng':
     st.title('📅 Đặt phòng')
@@ -220,7 +288,7 @@ elif menu == '📅 Đặt phòng':
                         st.error('Ngày nhận không được trong quá khứ và ngày trả phải sau ngày nhận.')
                     else:
                         with connect() as conn:
-                            current = conn.execute('SELECT * FROM rooms WHERE id=?',(room_id,)).fetchone()
+                            current = conn.execute('SELECT * FROM rooms WHERE id=? FOR UPDATE',(room_id,)).fetchone()
                             if current['status'] == 'Bảo trì' or booking_conflict(conn,room_id,start,end):
                                 st.error('Phòng bảo trì hoặc đã có lịch đặt trùng thời gian.')
                             else:
@@ -263,7 +331,7 @@ elif menu == '🔑 Nhận / Trả phòng':
             st.write(f"Ngày nhận: {item.checkin} | Ngày trả: {item.checkout}")
             if st.button('Xác nhận Check-in', type='primary'):
                 with connect() as conn:
-                    room = conn.execute('SELECT status FROM rooms WHERE id=?',(int(item.room_id),)).fetchone()
+                    room = conn.execute('SELECT status FROM rooms WHERE id=? FOR UPDATE',(int(item.room_id),)).fetchone()
                     occupied = conn.execute("SELECT COUNT(*) FROM bookings WHERE room_id=? AND status='Đang ở'",
                                             (int(item.room_id),)).fetchone()[0]
                     if room['status'] != 'Sạch' or occupied:
@@ -359,5 +427,6 @@ elif menu == '💰 Doanh thu':
         table(report)
         st.download_button('📥 Xuất CSV',report.to_csv(index=False).encode('utf-8-sig'),
                            file_name='bao_cao_doanh_thu.csv',mime='text/csv')
+
 
 
