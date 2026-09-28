@@ -15,7 +15,7 @@ HOUSEKEEPING = ['Sạch', 'Bẩn', 'Đang vệ sinh', 'Bảo trì']
 
 def today():
     return datetime.now(ZoneInfo('Asia/Ho_Chi_Minh')).date()
-st.set_page_config(page_title='KHÁCH SẠN HI VỌNG', page_icon='🏨', layout='wide')
+st.set_page_config(page_title='Khách sạn Hi Vọng', page_icon='🏨', layout='wide')
 
 # Thông tin kết nối Aiven MySQL
 DB_USER = "avnadmin"
@@ -261,7 +261,7 @@ h1,h2,h3{color:#16375d}
 </style>''', unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title('🏨 HOTEL MANAGER')
+    st.title('🏨 HI VỌNG HOTEL')
     menu = st.radio('Điều hướng', ['📊 Tổng quan', '🛏️ Quản lý phòng',
         '📅 Đặt phòng', '🔑 Nhận / Trả phòng', '🧹 Buồng phòng',
         '👥 Khách hàng', '💰 Doanh thu'], key='main_menu')
@@ -273,12 +273,12 @@ if _flash:
     st.success(_flash)
 
 if menu == '📊 Tổng quan':
-    st.title('🏨 HOTEL MANAGEMENT SYSTEM')
+    st.title('🏨 KHÁCH SẠN HI VỌNG')
     if IMAGE.exists():
-        st.image(str(IMAGE), caption='Hệ thống quản lý khách sạn', use_container_width=True)
+        st.image(str(IMAGE), caption='Khách sạn Hi Vọng', use_container_width=True)
     else:
         st.info('Đặt ảnh khachsan.jpg cùng thư mục với app.py để hiển thị ảnh khách sạn.')
-    st.subheader('Tổng quan khách sạn')
+    st.subheader('Tổng quan Khách sạn Hi Vọng')
     r, b = rooms(), bookings()
     occupied = int((r.display_status == 'Có khách').sum())
     clean = int((r.display_status == 'Sạch').sum())
