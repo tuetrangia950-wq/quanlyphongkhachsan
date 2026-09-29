@@ -19,6 +19,7 @@ HOUSEKEEPING = ['Sạch', 'Bẩn', 'Đang vệ sinh', 'Bảo trì']
 
 def today():
     return datetime.now(ZoneInfo('Asia/Ho_Chi_Minh')).date()
+
 st.set_page_config(page_title='Khách sạn Hi Vọng', page_icon='🏨', layout='wide')
 
 # Thông tin kết nối Aiven MySQL
@@ -26,7 +27,7 @@ DB_USER = "avnadmin"
 DB_PASSWORD = st.secrets.get('DB_PASSWORD', os.environ.get('DB_PASSWORD', ''))
 DB_HOST = "mysql-39428747-tuetrangia950-3ce0.j.aivencloud.com"
 DB_PORT = 27114
-DB_NAME = "defaultdb"  # Đổi nếu database của bạn có tên khác
+DB_NAME = "defaultdb"
 
 DB_CONFIG = dict(
     host=DB_HOST, port=DB_PORT, user=DB_USER,
@@ -129,20 +130,20 @@ def initialize():
             CONSTRAINT fk_customer FOREIGN KEY (customer_id) REFERENCES customers(id),
             CONSTRAINT fk_room FOREIGN KEY (room_id) REFERENCES rooms(id),
             CONSTRAINT chk_dates CHECK (checkout > checkin)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+        """CREATE TABLE IF NOT EXISTS employees (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(80) NOT NULL UNIQUE,
+            full_name VARCHAR(255) NOT NULL,
+            password_hash VARCHAR(255) NOT NULL,
+            role VARCHAR(20) NOT NULL DEFAULT 'staff',
+            active TINYINT(1) NOT NULL DEFAULT 1
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
     ]
-    statements.append("""CREATE TABLE IF NOT EXISTS employees (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        username VARCHAR(80) NOT NULL UNIQUE,
-        full_name VARCHAR(255) NOT NULL,
-        password_hash VARCHAR(255) NOT NULL,
-        role VARCHAR(20) NOT NULL DEFAULT 'staff',
-        active TINYINT(1) NOT NULL DEFAULT 1
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
     with connect() as conn:
         for sql in statements:
             conn.execute(sql)
-        # Chỉ tạo 8 phòng gốc nếu cơ sở dữ liệu hoàn toàn chưa có phòng.
+        
         if conn.execute('SELECT COUNT(*) FROM rooms').fetchone()[0] == 0:
             conn.executemany('INSERT INTO rooms(number,room_type,price,status,note) VALUES(?,?,?,?,?)',
                 [(n, t, p, 'Sạch', '') for n,t,p in [
@@ -151,7 +152,6 @@ def initialize():
                     ('301','Deluxe',1500000),('302','Deluxe',1500000),
                     ('401','Suite',2500000),('501','Villa',4500000)]])
 
-        # Nâng cấp bảng cũ mà không xóa đơn đặt phòng hiện có.
         for field in ('adults', 'children'):
             found = conn.execute(
                 'SELECT COUNT(*) FROM information_schema.COLUMNS '
@@ -161,7 +161,6 @@ def initialize():
             if not found:
                 conn.execute(f'ALTER TABLE bookings ADD COLUMN {field} INT NOT NULL DEFAULT 0')
 
-        # Bổ sung thông tin khách hàng vào bảng hiện có, không xóa dữ liệu cũ.
         customer_columns = {
             'citizen_id': "VARCHAR(20) NULL",
             'birth_date': "DATE NULL",
@@ -176,7 +175,6 @@ def initialize():
             if not found:
                 conn.execute(f'ALTER TABLE customers ADD COLUMN {field} {sql_type}')
 
-        # Đánh dấu lần bổ sung 12 phòng để không tự thêm lại phòng đã xóa.
         conn.execute("""CREATE TABLE IF NOT EXISTS app_meta (
             meta_key VARCHAR(100) PRIMARY KEY,
             meta_value VARCHAR(255) NOT NULL
@@ -217,7 +215,6 @@ def customers():
     return read('SELECT * FROM customers ORDER BY id DESC')
 
 def customers_with_rooms():
-    # Mỗi khách một dòng; chỉ hiện phòng có đơn chưa hủy và chưa trả.
     return read('''SELECT c.id, c.name, c.phone, c.email,
         c.citizen_id, c.birth_date, c.address,
         COALESCE(GROUP_CONCAT(DISTINCT CASE
@@ -254,7 +251,6 @@ def message_and_reload(text):
     st.session_state['flash_message'] = text
     st.rerun()
 
-# Mật khẩu nhân viên được băm có salt, không lưu mật khẩu dạng văn bản.
 def hash_password(password):
     salt = secrets.token_bytes(16)
     digest = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 310000)
@@ -271,16 +267,57 @@ def verify_password(password, encoded):
     except (ValueError, TypeError):
         return False
 
+def generate_bot_response(prompt):
+    prompt_lower = prompt.lower()
+    
+    if any(k in prompt_lower for k in ["trống", "rảnh", "sẵn sàng", "sạch"]):
+        r = rooms()
+        clean = r[r.display_status == 'Sạch']
+        if not clean.empty:
+            list_str = ", ".join([f"Phòng {x.number} ({x.room_type})" for x in clean.itertuples()])
+            return f"🏨 hiện tại khách sạn có **{len(clean)} phòng sạch/trống** sẵn sàng đón khách:\n\n👉 {list_str}"
+        return "⚠️ Hiện tại không còn phòng nào ở trạng thái Sạch/Trống."
+        
+    elif any(k in prompt_lower for k in ["giá", "bao nhiêu", "bảng giá", "loại phòng"]):
+        prices = "\n".join([f"- **{k}**: {v:,} VNĐ/đêm" for k, v in TYPES.items()])
+        return f"📋 **Bảng giá các hạng phòng niêm yết:**\n\n{prices}"
+        
+    elif any(k in prompt_lower for k in ["đang ở", "khách ở", "số khách"]):
+        b = bookings()
+        active = b[b.status == 'Đang ở']
+        if not active.empty:
+            total_guests = active.adults.sum() + active.children.sum()
+            list_str = ", ".join([f"Phòng {x.room} ({x.customer})" for x in active.itertuples()])
+            return f"👥 Hiện tại có **{len(active)} phòng đang có khách** (Tổng {total_guests} người):\n\n👉 {list_str}"
+        return "ℹ️ Hiện tại không có phòng nào đang có khách lưu trú."
+        
+    elif "checkin" in prompt_lower or "nhận phòng" in prompt_lower:
+        return "🔑 **Quy trình Check-in:**\n1. Vào mục '🔑 Nhận / Trả phòng' -> chọn tab Check-in.\n2. Chọn mã đơn đặt phòng của khách.\n3. Đối chiếu thông tin căn cước & xác nhận (Phòng phải ở trạng thái **Sạch**)."
+        
+    elif "checkout" in prompt_lower or "trả phòng" in prompt_lower:
+        return "🚪 **Quy trình Check-out:**\n1. Vào mục '🔑 Nhận / Trả phòng' -> chọn tab Check-out.\n2. Chọn đơn phòng cần trả, nhập số tiền thực thu.\n3. Xác nhận để ghi nhận doanh thu (Phòng sẽ tự chuyển sang **Bẩn**)."
+
+    elif "doanh thu" in prompt_lower or "tiền" in prompt_lower:
+        b = bookings()
+        paid = b[b.status == 'Đã trả']
+        return f"💰 Tổng doanh thu đã ghi nhận hiện tại là: **{vnd(paid.total.sum())}** (từ {len(paid)} đơn checkout thành công)."
+
+    return ("🤖 Tôi là trợ lý ảo Khách sạn Hi Vọng. Bạn có thể hỏi tôi:\n"
+            "- *Tìm phòng trống / phòng sạch*\n"
+            "- *Xem giá các loại phòng*\n"
+            "- *Danh sách phòng đang có khách*\n"
+            "- *Hướng dẫn checkin / checkout*\n"
+            "- *Tổng doanh thu*")
+
 def login_screen():
     st.title('🏨 KHÁCH SẠN HI VỌNG')
     st.subheader('Đăng nhập nhân viên')
     with connect() as conn:
         count = conn.execute('SELECT COUNT(*) FROM employees').fetchone()[0]
     if count == 0:
-        # Khóa khởi tạo phải do chủ ứng dụng đặt trong Streamlit Cloud Secrets.
         setup_token = st.secrets.get('ADMIN_SETUP_TOKEN', os.environ.get('ADMIN_SETUP_TOKEN', ''))
         if not setup_token:
-            st.warning('Chưa có tài khoản quản trị. Chủ ứng dụng cần thêm ADMIN_SETUP_TOKEN vào Streamlit Cloud → App settings → Secrets trước khi tạo tài khoản đầu tiên.')
+            st.warning('Chưa có tài khoản quản trị. Vui lòng cấu hình ADMIN_SETUP_TOKEN trong Secrets trước khi tiếp tục.')
             st.stop()
         st.info('Thiết lập tài khoản quản trị lần đầu.')
         with st.form('first_admin'):
@@ -321,19 +358,17 @@ def login_screen():
             st.error('Sai tên đăng nhập, mật khẩu hoặc tài khoản đã bị khóa.')
     st.stop()
 
-# Kiểm tra kết nối thật trước khi hiển thị ứng dụng.
 if not DB_PASSWORD:
     st.error('Thiếu DB_PASSWORD trong Streamlit Secrets.')
     st.stop()
+
 try:
     with connect() as _db:
         _db.execute('SELECT 1').fetchone()
     initialize()
-    db_connected = True
 except mysql.connector.Error as exc:
     st.error('🔴 Không thể kết nối MySQL Aiven hoặc khởi tạo database.')
     st.code(f'Mã lỗi: {exc.errno} | {exc.msg}')
-    st.info('Kiểm tra tên database, tài khoản, cổng 27114 và trạng thái dịch vụ trên Aiven.')
     st.stop()
 
 if 'employee' not in st.session_state:
@@ -353,12 +388,11 @@ with st.sidebar:
         st.rerun()
     menu_items = ['📊 Tổng quan', '🛏️ Quản lý phòng',
         '📅 Đặt phòng', '🔑 Nhận / Trả phòng', '🧹 Buồng phòng',
-        '👥 Khách hàng', '💰 Doanh thu']
+        '👥 Khách hàng', '💰 Doanh thu', '🤖 Trợ lý AI']
     if st.session_state['employee']['role'] == 'admin':
         menu_items.append('🔐 Nhân viên')
     menu = st.radio('Điều hướng', menu_items, key='main_menu')
     st.success('🟢 Đã kết nối MySQL Aiven')
-    st.caption(f'Database: {DB_NAME} | Cổng: {DB_PORT}')
 
 _flash = st.session_state.pop('flash_message', None)
 if _flash:
@@ -389,7 +423,6 @@ if menu == '📊 Tổng quan':
     g.metric('Doanh thu dự kiến (chưa trả)', vnd(expected))
     h.metric('Doanh thu đã ghi nhận', vnd(revenue))
     st.metric('Công suất phòng hiện tại', f'{occupied / len(r) * 100:.1f}%' if len(r) else '0%')
-    st.caption('Đơn đặt trong tương lai không tính là phòng đang có khách. Doanh thu chỉ ghi nhận sau Check-out.')
     if not r.empty:
         counts = r.display_status.value_counts().rename_axis('Trạng thái').reset_index(name='Số phòng')
         st.plotly_chart(px.pie(counts, names='Trạng thái', values='Số phòng', hole=.4),
@@ -472,7 +505,6 @@ elif menu == '📅 Đặt phòng':
             customer_options = {f'{x.id} – {x.name}':int(x.id) for x in c.itertuples()}
             room_options = {f'{x.number} – {x.room_type} – {vnd(x.price)}/đêm':int(x.id)
                             for x in r.itertuples() if x.status != 'Bảo trì'}
-            # Tự chọn khách vừa được tạo sau khi chuyển trang.
             new_customer_id = st.session_state.get('booking_customer_id')
             customer_labels = list(customer_options)
             default_index = next((i for i, label in enumerate(customer_labels)
@@ -480,8 +512,7 @@ elif menu == '📅 Đặt phòng':
             if new_customer_id is not None:
                 st.info('Đã lưu khách hàng. Vui lòng chọn phòng và ngày lưu trú để hoàn tất đặt phòng.')
             with st.form('create_booking'):
-                customer_label = st.selectbox('Khách hàng', customer_labels,
-                                              index=default_index)
+                customer_label = st.selectbox('Khách hàng', customer_labels, index=default_index)
                 start = st.date_input('Ngày nhận', today())
                 end = st.date_input('Ngày trả', today()+timedelta(days=1))
                 room_label = st.selectbox('Phòng', list(room_options)) if room_options else None
@@ -563,7 +594,6 @@ elif menu == '🔑 Nhận / Trả phòng':
             st.write(f'Tiền phòng dự kiến: {vnd(item.total)}')
             total = st.number_input('Số tiền thanh toán thực tế (VNĐ)',
                                     min_value=0, value=int(item.total), step=100000)
-            st.caption('Doanh thu được ghi nhận khi xác nhận trả phòng; chưa tích hợp cổng thanh toán.')
             if st.button('Xác nhận Check-out', type='primary'):
                 with connect() as conn:
                     conn.execute("UPDATE bookings SET status='Đã trả',actual_checkout=?,total=? WHERE id=? AND status='Đang ở'",
@@ -604,7 +634,6 @@ elif menu == '👥 Khách hàng':
                   c.phone.str.contains(keyword, case=False, regex=False, na=False) |
                   c.room_numbers.str.contains(keyword, case=False, regex=False, na=False)]
         if not c.empty:
-            # Không hiển thị toàn bộ số CCCD trên bảng tổng hợp.
             c = c.copy()
             c['citizen_id'] = c.citizen_id.fillna('').apply(
                 lambda x: ('*' * max(0, len(str(x)) - 4) + str(x)[-4:]) if x else '')
@@ -621,8 +650,7 @@ elif menu == '👥 Khách hàng':
         st.caption('Sau khi lưu thành công, ứng dụng tự chuyển sang Đặt phòng và chọn sẵn khách vừa tạo.')
         with st.form('new_customer'):
             name = st.text_input('Họ tên *')
-            citizen_id = st.text_input('Số căn cước công dân', max_chars=12,
-                                       help='Nhập 12 chữ số; có thể để trống nếu chưa cung cấp.')
+            citizen_id = st.text_input('Số căn cước công dân', max_chars=12)
             birth_date = st.date_input('Ngày tháng năm sinh', value=None,
                                        min_value=date(1900, 1, 1), max_value=today(),
                                        format='DD/MM/YYYY')
@@ -652,83 +680,118 @@ elif menu == '👥 Khách hàng':
                             new_id = conn.execute(
                                 'INSERT INTO customers(name,phone,email,citizen_id,birth_date,address) '
                                 'VALUES(?,?,?,?,?,?)',
-                                (name, phone.strip(), email.strip(), citizen_id or None,
-                                 birth_date, address.strip())
+                                (name, phone.strip(), email.strip(), citizen_id or None, birth_date, address.strip() or None)
                             ).lastrowid
-                        # Chỉ chuyển trang SAU KHI transaction đã commit thành công.
-                        st.session_state['booking_customer_id'] = int(new_id)
+                        st.session_state['booking_customer_id'] = new_id
                         st.session_state['main_menu'] = '📅 Đặt phòng'
-                        st.session_state['flash_message'] = 'Đã lưu khách hàng thành công.'
-                        st.rerun()
+                        message_and_reload(f'Đã lưu khách hàng "{name}". Chuyển sang tạo đặt phòng.')
                     except mysql.connector.Error as exc:
-                        st.error(f'Không thể lưu khách hàng: {exc.msg}')
+                        st.error(f'Lỗi cơ sở dữ liệu: {exc.msg}')
 
 elif menu == '💰 Doanh thu':
-    st.title('💰 Báo cáo doanh thu')
+    st.title('💰 Doanh thu')
     b = bookings()
-    completed = b[b.status == 'Đã trả'].copy()
-    revenue = int(completed.total.sum()) if not completed.empty else 0
-    a,c,d = st.columns(3)
-    a.metric('Doanh thu đã ghi nhận',vnd(revenue))
-    c.metric('Lượt lưu trú hoàn tất',len(completed))
-    d.metric('Trung bình / lượt',vnd(revenue / len(completed) if len(completed) else 0))
-    if completed.empty:
-        st.info('Chưa có lượt trả phòng để thống kê.')
+    if b.empty or (b.status == 'Đã trả').sum() == 0:
+        st.info('Chưa có dữ liệu doanh thu từ các đơn đã checkout.')
     else:
-        completed['Tháng'] = pd.to_datetime(completed.actual_checkout).dt.strftime('%Y-%m')
-        monthly = completed.groupby('Tháng',as_index=False)['total'].sum()
-        st.plotly_chart(px.bar(monthly,x='Tháng',y='total',labels={'total':'Doanh thu (VNĐ)'}),
-                        use_container_width=True)
-        report = completed[['id','customer','room','checkin','checkout','actual_checkout','total']].copy()
-        report.columns = ['Mã đặt','Khách hàng','Phòng','Ngày nhận dự kiến',
-                          'Ngày trả dự kiến','Ngày trả thực tế','Doanh thu']
-        table(report)
-        st.download_button('📥 Xuất CSV',report.to_csv(index=False).encode('utf-8-sig'),
-                           file_name='bao_cao_doanh_thu.csv',mime='text/csv')
+        paid = b[b.status == 'Đã trả'].copy()
+        paid['checkout_date'] = paid['actual_checkout'].fillna(paid['checkout'])
+        
+        st.subheader('Tổng quan doanh thu')
+        col1, col2, col3 = st.columns(3)
+        col1.metric('Tổng doanh thu đã thu', vnd(paid['total'].sum()))
+        col2.metric('Tổng số lượt đặt phòng hoàn tất', len(paid))
+        col3.metric('Giá trị trung bình / đơn', vnd(paid['total'].mean()))
+        
+        st.subheader('Doanh thu theo loại phòng')
+        rev_by_type = paid.groupby('room_type')['total'].sum().reset_index()
+        rev_by_type.columns = ['Loại phòng', 'Doanh thu (VNĐ)']
+        st.plotly_chart(px.bar(rev_by_type, x='Loại phòng', y='Doanh thu (VNĐ)', color='Loại phòng', text_auto=True), use_container_width=True)
+        
+        st.subheader('Lịch sử thanh toán')
+        table(paid[['id', 'customer', 'room', 'checkin', 'actual_checkout', 'total']].rename(columns={
+            'id': 'Mã đơn', 'customer': 'Khách hàng', 'room': 'Phòng',
+            'checkin': 'Ngày check-in', 'actual_checkout': 'Ngày check-out', 'total': 'Tổng tiền'
+        }))
 
+elif menu == '🤖 Trợ lý AI':
+    st.title('🤖 Trợ lý AI & Tra cứu nhanh')
+    st.caption('Trợ lý ảo hỗ trợ nhân viên tra cứu trạng thái phòng, bảng giá và quy trình làm việc.')
+    
+    if "messages" not in st.session_state:
+        st.session_state.messages = [
+            {"role": "assistant", "content": "Xin chào! Tôi là Trợ lý AI của Khách sạn Hi Vọng. Bạn cần tôi hỗ trợ tra cứu thông tin gì hôm nay?"}
+        ]
 
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
 
+    if prompt := st.chat_input("Nhập câu hỏi (VD: phòng trống, giá phòng, quy trình checkin...)..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.write(prompt)
+
+        response = generate_bot_response(prompt)
+
+        with st.chat_message("assistant"):
+            st.write(response)
+        st.session_state.messages.append({"role": "assistant", "content": response})
 
 elif menu == '🔐 Nhân viên' and st.session_state['employee']['role'] == 'admin':
-    st.title('🔐 Quản lý tài khoản nhân viên')
-    with st.form('create_employee'):
-        username = st.text_input('Tên đăng nhập mới').strip().lower()
-        full_name = st.text_input('Họ tên nhân viên')
-        password = st.text_input('Mật khẩu tạm (tối thiểu 12 ký tự)', type='password')
-        role = st.selectbox('Vai trò', ['staff', 'admin'], format_func=lambda x: 'Nhân viên' if x == 'staff' else 'Quản trị')
-        if st.form_submit_button('Tạo nhân viên'):
-            if not username or not full_name.strip() or len(password) < 12:
-                st.error('Nhập đầy đủ thông tin và mật khẩu tối thiểu 12 ký tự.')
-            else:
-                try:
-                    write('INSERT INTO employees(username,full_name,password_hash,role) VALUES(?,?,?,?)',
-                          (username, full_name.strip(), hash_password(password), role))
-                    st.success('Đã tạo tài khoản nhân viên.')
-                except mysql.connector.IntegrityError:
-                    st.error('Tên đăng nhập đã tồn tại.')
-    employee_df = read('SELECT id, username, full_name, role, active FROM employees ORDER BY id')
-    st.dataframe(employee_df, use_container_width=True, hide_index=True)
-    other = employee_df[employee_df['id'] != st.session_state['employee']['id']]
-    if not other.empty:
-        options = {f"{row.username} – {row.full_name}": int(row.id) for row in other.itertuples()}
-        chosen = options[st.selectbox('Chọn tài khoản để khóa / mở khóa', list(options))]
-        if st.button('Đổi trạng thái tài khoản'):
-            write('UPDATE employees SET active=1-active WHERE id=?', (chosen,))
-            st.rerun()
-    st.subheader('Đổi mật khẩu của tôi')
-    with st.form('change_password'):
-        old_password = st.text_input('Mật khẩu hiện tại', type='password')
-        new_password = st.text_input('Mật khẩu mới', type='password')
-        if st.form_submit_button('Đổi mật khẩu'):
-            with connect() as conn:
-                me = conn.execute('SELECT password_hash FROM employees WHERE id=?',
-                                  (st.session_state['employee']['id'],)).fetchone()
-            if not verify_password(old_password, me['password_hash']):
-                st.error('Mật khẩu hiện tại không đúng.')
-            elif len(new_password) < 12:
-                st.error('Mật khẩu mới phải có ít nhất 12 ký tự.')
-            else:
-                write('UPDATE employees SET password_hash=? WHERE id=?',
-                      (hash_password(new_password), st.session_state['employee']['id']))
-                st.success('Đã đổi mật khẩu.')
+    st.title('🔐 Quản lý nhân viên')
+    tab1, tab2 = st.tabs(['Danh sách nhân viên', 'Thêm nhân viên mới'])
+    
+    with tab1:
+        employees_df = read('SELECT id, username, full_name, role, active FROM employees ORDER BY id DESC')
+        if not employees_df.empty:
+            employees_df['active_status'] = employees_df['active'].apply(lambda x: 'Hoạt động' if x == 1 else 'Đã khóa')
+            table(employees_df[['id', 'username', 'full_name', 'role', 'active_status']].rename(columns={
+                'id': 'ID', 'username': 'Tên đăng nhập', 'full_name': 'Họ và tên',
+                'role': 'Vai trò', 'active_status': 'Trạng thái'
+            }))
+            
+            st.subheader('Cập nhật trạng thái / Vai trò')
+            emp_choices = {f"{row.username} ({row.full_name})": row.id for row in employees_df.itertuples()}
+            selected_emp = st.selectbox('Chọn nhân viên', list(emp_choices))
+            selected_id = emp_choices[selected_emp]
+            
+            with st.form('update_employee'):
+                new_role = st.selectbox('Vai trò', ['staff', 'admin'])
+                new_active = st.selectbox('Trạng thái', ['Hoạt động', 'Đã khóa'])
+                if st.form_submit_button('Lưu thay đổi', type='primary'):
+                    if selected_id == st.session_state['employee']['id'] and new_active == 'Đã khóa':
+                        st.error('Không thể tự khóa tài khoản của chính mình.')
+                    else:
+                        active_val = 1 if new_active == 'Hoạt động' else 0
+                        write('UPDATE employees SET role=?, active=? WHERE id=?', (new_role, active_val, selected_id))
+                        message_and_reload('Đã cập nhật thông tin nhân viên.')
+        else:
+            st.info('Chưa có dữ liệu nhân viên.')
+            
+    with tab2:
+        with st.form('add_employee'):
+            username = st.text_input('Tên đăng nhập *').strip().lower()
+            full_name = st.text_input('Họ và tên *').strip()
+            password = st.text_input('Mật khẩu * (Tối thiểu 12 ký tự)', type='password')
+            role = st.selectbox('Vai trò', ['staff', 'admin'])
+            if st.form_submit_button('Tạo tài khoản', type='primary'):
+                if not username or not full_name:
+                    st.error('Vui lòng điền đầy đủ tên đăng nhập và họ tên.')
+                elif len(password) < 12:
+                    st.error('Mật khẩu phải có ít nhất 12 ký tự.')
+                else:
+                    try:
+                        write('INSERT INTO employees(username, full_name, password_hash, role) VALUES(?,?,?,?)',
+                              (username, full_name, hash_password(password), role))
+                        message_and_reload(f'Đã tạo tài khoản nhân viên "{username}" thành công.')
+                    except mysql.connector.IntegrityError:
+                        st.error('Tên đăng nhập đã tồn tại trong hệ thống.')
 
+# --- Chatbot Pop-up Widget ở góc dưới ---
+if menu != '🤖 Trợ lý AI':
+    with st.popover("💬 Trợ lý tra cứu nhanh", use_container_width=False):
+        st.subheader("🤖 Trợ lý AI Khách sạn")
+        q = st.text_input("Hỏi nhanh (VD: giá phòng, phòng trống...):")
+        if q:
+            st.markdown(generate_bot_response(q))
