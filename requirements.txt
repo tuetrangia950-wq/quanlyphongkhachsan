@@ -2,3 +2,4 @@ streamlit
 mysql-connector-python
 pandas
 plotly
+google-genai
