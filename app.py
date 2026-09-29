@@ -10,6 +10,7 @@ import mysql.connector
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from google import genai
 
 BASE = Path(__file__).resolve().parent
 IMAGE = BASE / 'khachsan.jpg'
@@ -28,6 +29,9 @@ DB_PASSWORD = st.secrets.get('DB_PASSWORD', os.environ.get('DB_PASSWORD', ''))
 DB_HOST = "mysql-39428747-tuetrangia950-3ce0.j.aivencloud.com"
 DB_PORT = 27114
 DB_NAME = "defaultdb"
+
+# Cấu hình Gemini AI Key
+GEMINI_KEY = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
 
 DB_CONFIG = dict(
     host=DB_HOST, port=DB_PORT, user=DB_USER,
@@ -267,47 +271,122 @@ def verify_password(password, encoded):
     except (ValueError, TypeError):
         return False
 
+# --- HÀM TRỢ LÝ AI GEMINI THÔNG MINH ---
 def generate_bot_response(prompt):
-    prompt_lower = prompt.lower()
+    # Dữ liệu thực tế từ hệ thống
+    r_df = rooms()
+    b_df = bookings()
+    active_b = b_df[b_df.status == 'Đang ở']
+    paid_b = b_df[b_df.status == 'Đã trả']
+    clean_rooms = r_df[r_df.display_status == 'Sạch']
     
-    if any(k in prompt_lower for k in ["trống", "rảnh", "sẵn sàng", "sạch"]):
-        r = rooms()
-        clean = r[r.display_status == 'Sạch']
+    # 1. Nếu đã cài GEMINI_API_KEY -> Xử lý bằng AI Gemini 2.5 Flash
+    if GEMINI_KEY:
+        try:
+            client = genai.Client(api_key=GEMINI_KEY)
+            
+            context = f"""
+            Bạn là Trợ lý AI thông minh phục vụ nội bộ Khách sạn Hi Vọng.
+            Hãy trả lời ngắn gọn, thân thiện, chính xác bằng tiếng Việt dựa vào dữ liệu hệ thống thời gian thực dưới đây:
+
+            --- BẢNG GIÁ NIÊM YẾT ---
+            {TYPES}
+
+            --- TRẠNG THÁI PHÒNG THỰC TẾ ---
+            - Tổng số phòng: {len(r_df)} phòng
+            - Phòng trống/sạch ({len(clean_rooms)} phòng): {", ".join(clean_rooms['number'].tolist()) if not clean_rooms.empty else "Không có"}
+            - Chi tiết tất cả phòng:
+            {r_df[['number', 'room_type', 'price', 'display_status']].to_string(index=False)}
+
+            --- THÔNG TIN LƯU TRÚ & DOANH THU ---
+            - Số phòng đang có khách ({len(active_b)} phòng): {", ".join([f"Phòng {x.room} ({x.customer})" for x in active_b.itertuples()]) if not active_b.empty else "Không có"}
+            - Tổng số khách đang ở: {int(active_b.adults.sum() + active_b.children.sum()) if not active_b.empty else 0} người
+            - Doanh thu thực tế đã thu: {paid_b['total'].sum():,} VNĐ (từ {len(paid_b)} đơn checkout)
+
+            --- QUY TRÌNH NỘI BỘ ---
+            1. Check-in:
+               - Thời gian tiêu chuẩn: Từ 14:00.
+               - Nhận phòng sớm: 06:00 - 10:00 (phụ thu 50%), 10:00 - 14:00 (phụ thu 30%).
+               - Điều kiện: Phòng phải ở trạng thái "Sạch" và xác minh CCCD/Hộ chiếu khách.
+            2. Check-out:
+               - Thời gian tiêu chuẩn: Trước 12:00 trưa.
+               - Trả phòng trễ: 12:00 - 15:00 (phụ thu 30%), 15:00 - 18:00 (phụ thu 50%), Sau 18:00 (tính 100% đêm).
+               - Quy trình: Báo buồng phòng kiểm tra minibar -> Thu tiền -> Hệ thống chuyển trạng thái phòng sang "Bẩn".
+            3. Buồng phòng & Đồ thất lạc (Lost & Found):
+               - Trạng thái phòng: Sạch, Bẩn, Đang vệ sinh, Bảo trì.
+               - Đồ bỏ quên: Niêm phong ghi rõ (Số phòng, Ngày, Nhân viên) -> Bàn giao Lễ tân -> Liên hệ khách.
+            4. Hotline khẩn cấp:
+               - Quản lý ca: 0901.234.567 | Kỹ thuật: Nhánh 102 (0902.111.222) | Bảo vệ: Nhánh 100 | PCCC: 114.
+            """
+            
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=f"{context}\n\nCâu hỏi của nhân viên: {prompt}"
+            )
+            return response.text
+        except Exception as e:
+            return f"⚠️ Lỗi kết nối AI Gemini ({str(e)}). Đang chuyển sang chế độ dự phòng...\n\n" + _fallback_response(prompt, r_df, b_df)
+
+    # 2. Nếu chưa cấu hình GEMINI_API_KEY -> Chạy hàm dự phòng thông minh hơn
+    return _fallback_response(prompt, r_df, b_df)
+
+def _fallback_response(prompt, r_df, b_df):
+    p = prompt.lower()
+    
+    # Số lượng phòng
+    if any(k in p for k in ["bao nhiêu phòng", "mấy phòng", "tổng phòng", "có bao nhiu phòng", "số phòng"]):
+        return f"🏨 Khách sạn Hi Vọng hiện có tổng cộng **{len(r_df)} phòng**."
+    
+    # Rẻ nhất / Đắt nhất
+    elif any(k in p for k in ["rẻ nhất", "thấp nhất"]):
+        cheapest = min(TYPES.items(), key=lambda x: x[1])
+        return f"🏷️ Phòng có giá rẻ nhất là hạng **{cheapest[0]}** với giá **{cheapest[1]:,} VNĐ/đêm**."
+    elif any(k in p for k in ["đắt nhất", "cao nhất"]):
+        expensive = max(TYPES.items(), key=lambda x: x[1])
+        return f"💎 Hạng phòng cao cấp nhất là **{expensive[0]}** với giá **{expensive[1]:,} VNĐ/đêm**."
+        
+    # Phòng trống
+    elif any(k in p for k in ["trống", "rảnh", "sẵn sàng", "sạch"]):
+        clean = r_df[r_df.display_status == 'Sạch']
         if not clean.empty:
             list_str = ", ".join([f"Phòng {x.number} ({x.room_type})" for x in clean.itertuples()])
-            return f"🏨 hiện tại khách sạn có **{len(clean)} phòng sạch/trống** sẵn sàng đón khách:\n\n👉 {list_str}"
-        return "⚠️ Hiện tại không còn phòng nào ở trạng thái Sạch/Trống."
+            return f"🏨 Có **{len(clean)} phòng sạch/trống** sẵn sàng đón khách:\n👉 {list_str}"
+        return "⚠️ Hiện tại không còn phòng trống ở trạng thái Sạch."
         
-    elif any(k in prompt_lower for k in ["giá", "bao nhiêu", "bảng giá", "loại phòng"]):
+    # Giá phòng
+    elif any(k in p for k in ["giá", "bao nhiêu", "bảng giá", "loại phòng"]):
         prices = "\n".join([f"- **{k}**: {v:,} VNĐ/đêm" for k, v in TYPES.items()])
-        return f"📋 **Bảng giá các hạng phòng niêm yết:**\n\n{prices}"
+        return f"📋 **Bảng giá phòng niêm yết:**\n\n{prices}"
         
-    elif any(k in prompt_lower for k in ["đang ở", "khách ở", "số khách"]):
-        b = bookings()
-        active = b[b.status == 'Đang ở']
+    # Khách đang ở
+    elif any(k in p for k in ["đang ở", "khách ở"]):
+        active = b_df[b_df.status == 'Đang ở']
         if not active.empty:
-            total_guests = active.adults.sum() + active.children.sum()
             list_str = ", ".join([f"Phòng {x.room} ({x.customer})" for x in active.itertuples()])
-            return f"👥 Hiện tại có **{len(active)} phòng đang có khách** (Tổng {total_guests} người):\n\n👉 {list_str}"
-        return "ℹ️ Hiện tại không có phòng nào đang có khách lưu trú."
+            return f"👥 Hiện có **{len(active)} phòng đang có khách**:\n👉 {list_str}"
+        return "ℹ️ Hiện không có khách đang lưu trú."
         
-    elif "checkin" in prompt_lower or "nhận phòng" in prompt_lower:
-        return "🔑 **Quy trình Check-in:**\n1. Vào mục '🔑 Nhận / Trả phòng' -> chọn tab Check-in.\n2. Chọn mã đơn đặt phòng của khách.\n3. Đối chiếu thông tin căn cước & xác nhận (Phòng phải ở trạng thái **Sạch**)."
+    # Doanh thu
+    elif any(k in p for k in ["doanh thu", "tổng thu"]):
+        paid = b_df[b_df.status == 'Đã trả']
+        return f"💰 Tổng doanh thu thực tế đã thu: **{paid['total'].sum():,} VNĐ**."
         
-    elif "checkout" in prompt_lower or "trả phòng" in prompt_lower:
-        return "🚪 **Quy trình Check-out:**\n1. Vào mục '🔑 Nhận / Trả phòng' -> chọn tab Check-out.\n2. Chọn đơn phòng cần trả, nhập số tiền thực thu.\n3. Xác nhận để ghi nhận doanh thu (Phòng sẽ tự chuyển sang **Bẩn**)."
-
-    elif "doanh thu" in prompt_lower or "tiền" in prompt_lower:
-        b = bookings()
-        paid = b[b.status == 'Đã trả']
-        return f"💰 Tổng doanh thu đã ghi nhận hiện tại là: **{vnd(paid.total.sum())}** (từ {len(paid)} đơn checkout thành công)."
-
-    return ("🤖 Tôi là trợ lý ảo Khách sạn Hi Vọng. Bạn có thể hỏi tôi:\n"
-            "- *Tìm phòng trống / phòng sạch*\n"
-            "- *Xem giá các loại phòng*\n"
-            "- *Danh sách phòng đang có khách*\n"
-            "- *Hướng dẫn checkin / checkout*\n"
-            "- *Tổng doanh thu*")
+    # Quy trình Checkin / Checkout / Hotline
+    elif "checkin" in p or "nhận phòng" in p:
+        return "🔑 **Check-in:** Tiêu chuẩn từ 14:00. Nhận sớm 06:00-10:00 (phụ thu 50%), 10:00-14:00 (phụ thu 30%). Yêu cầu phòng Sạch & kiểm tra CCCD."
+    elif "checkout" in p or "trả phòng" in p:
+        return "🚪 **Check-out:** Tiêu chuẩn trước 12:00. Trễ 12:00-15:00 (+30%), 15:00-18:00 (+50%). Báo buồng phòng kiểm tra trước khi thu tiền."
+    elif any(k in p for k in ["hotline", "khẩn cấp", "sđt", "bảo vệ"]):
+        return "📞 **Hotline:** Quản lý ca (0901.234.567) | Kỹ thuật (Nhánh 102) | Bảo vệ (Nhánh 100)."
+        
+    return (
+        "🤖 **Trợ lý Khách sạn Hi Vọng**\n\n"
+        "Bạn có thể hỏi tôi các câu hỏi như:\n"
+        "- *Khách sạn có bao nhiêu phòng?*\n"
+        "- *Phòng nào rẻ nhất / đắt nhất?*\n"
+        "- *Danh sách phòng trống hôm nay?*\n"
+        "- *Quy trình checkin, checkout, hotline khẩn cấp...*"
+    )
 
 def login_screen():
     st.title('🏨 KHÁCH SẠN HI VỌNG')
@@ -388,11 +467,13 @@ with st.sidebar:
         st.rerun()
     menu_items = ['📊 Tổng quan', '🛏️ Quản lý phòng',
         '📅 Đặt phòng', '🔑 Nhận / Trả phòng', '🧹 Buồng phòng',
-        '👥 Khách hàng', '💰 Doanh thu', '🤖 Trợ lý AI']
+        '👥 Khách hàng', '💰 Doanh thu', '🤖 Trợ lý AI & Quy trình']
     if st.session_state['employee']['role'] == 'admin':
         menu_items.append('🔐 Nhân viên')
     menu = st.radio('Điều hướng', menu_items, key='main_menu')
     st.success('🟢 Đã kết nối MySQL Aiven')
+    if GEMINI_KEY:
+        st.info('✨ Đã bật Google Gemini AI')
 
 _flash = st.session_state.pop('flash_message', None)
 if _flash:
@@ -714,25 +795,41 @@ elif menu == '💰 Doanh thu':
             'checkin': 'Ngày check-in', 'actual_checkout': 'Ngày check-out', 'total': 'Tổng tiền'
         }))
 
-elif menu == '🤖 Trợ lý AI':
-    st.title('🤖 Trợ lý AI & Tra cứu nhanh')
-    st.caption('Trợ lý ảo hỗ trợ nhân viên tra cứu trạng thái phòng, bảng giá và quy trình làm việc.')
+elif menu == '🤖 Trợ lý AI & Quy trình':
+    st.title('🤖 Trợ lý AI & Quy trình Nội bộ')
+    st.caption('Trợ lý Gemini AI hỗ trợ nhân viên tra cứu nhanh dữ liệu phòng thực tế và quy trình vận hành khách sạn.')
     
+    st.markdown("**Gợi ý tra cứu nhanh:**")
+    col1, col2, col3, col4, col5 = st.columns(5)
+    btn_prompt = None
+    if col1.button("🔑 Quy trình Checkin"):
+        btn_prompt = "quy trình checkin"
+    if col2.button("🚪 Quy trình Checkout"):
+        btn_prompt = "quy trình checkout"
+    if col3.button("🛏️ Tìm phòng trống"):
+        btn_prompt = "phòng trống"
+    if col4.button("🏷️ Phòng rẻ nhất"):
+        btn_prompt = "phòng nào rẻ nhất"
+    if col5.button("📞 Hotline khẩn cấp"):
+        btn_prompt = "hotline"
+
     if "messages" not in st.session_state:
         st.session_state.messages = [
-            {"role": "assistant", "content": "Xin chào! Tôi là Trợ lý AI của Khách sạn Hi Vọng. Bạn cần tôi hỗ trợ tra cứu thông tin gì hôm nay?"}
+            {"role": "assistant", "content": "Xin chào! Tôi là Trợ lý AI Gemini của Khách sạn Hi Vọng. Bạn cần tôi hỗ trợ tra cứu phòng trống, giá phòng hay quy trình gì hôm nay?"}
         ]
 
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
 
-    if prompt := st.chat_input("Nhập câu hỏi (VD: phòng trống, giá phòng, quy trình checkin...)..."):
+    prompt = btn_prompt or st.chat_input("Nhập câu hỏi (VD: phòng rẻ nhất, có bao nhiêu phòng, checkin, hotline...)...")
+    if prompt:
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.write(prompt)
 
-        response = generate_bot_response(prompt)
+        with st.spinner("Gemini đang suy nghĩ..."):
+            response = generate_bot_response(prompt)
 
         with st.chat_message("assistant"):
             st.write(response)
@@ -788,10 +885,11 @@ elif menu == '🔐 Nhân viên' and st.session_state['employee']['role'] == 'adm
                     except mysql.connector.IntegrityError:
                         st.error('Tên đăng nhập đã tồn tại trong hệ thống.')
 
-# --- Chatbot Pop-up Widget ở góc dưới ---
-if menu != '🤖 Trợ lý AI':
-    with st.popover("💬 Trợ lý tra cứu nhanh", use_container_width=False):
-        st.subheader("🤖 Trợ lý AI Khách sạn")
-        q = st.text_input("Hỏi nhanh (VD: giá phòng, phòng trống...):")
+# --- Widget Chatbot Tra cứu nhanh ở góc màn hình ---
+if menu != '🤖 Trợ lý AI & Quy trình':
+    with st.popover("💬 Trợ lý Gemini AI", use_container_width=False):
+        st.subheader("🤖 Tra cứu nhanh")
+        q = st.text_input("Hỏi Gemini AI (VD: phòng rẻ nhất, bao nhiêu phòng, checkin...):")
         if q:
-            st.markdown(generate_bot_response(q))
+            with st.spinner("AI đang trả lời..."):
+                st.markdown(generate_bot_response(q))
